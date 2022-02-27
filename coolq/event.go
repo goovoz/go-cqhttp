@@ -2,49 +2,44 @@ package coolq
 
 import (
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Mrs4s/go-cqhttp/global"
-
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/message"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/Mrs4s/go-cqhttp/db"
+	"github.com/Mrs4s/go-cqhttp/global"
+	"github.com/Mrs4s/go-cqhttp/internal/base"
+	"github.com/Mrs4s/go-cqhttp/internal/cache"
 )
 
-var format = "string"
-
-// SetMessageFormat 设置消息上报格式，默认为string
-func SetMessageFormat(f string) {
-	format = f
-}
-
 // ToFormattedMessage 将给定[]message.IMessageElement转换为通过coolq.SetMessageFormat所定义的消息上报格式
-func ToFormattedMessage(e []message.IMessageElement, groupID int64, isRaw ...bool) (r interface{}) {
-	if format == "string" {
-		r = ToStringMessage(e, groupID, isRaw...)
-	} else if format == "array" {
-		r = ToArrayMessage(e, groupID)
+func ToFormattedMessage(e []message.IMessageElement, source MessageSource, isRaw ...bool) (r interface{}) {
+	if base.PostFormat == "string" {
+		r = ToStringMessage(e, source, isRaw...)
+	} else if base.PostFormat == "array" {
+		r = ToArrayMessage(e, source)
 	}
 	return
 }
 
 func (bot *CQBot) privateMessageEvent(c *client.QQClient, m *message.PrivateMessage) {
-	bot.checkMedia(m.Elements)
-	cqm := ToStringMessage(m.Elements, 0, true)
-	if !m.Sender.IsFriend {
-		bot.oneWayMsgCache.Store(m.Sender.Uin, "")
+	bot.checkMedia(m.Elements, m.Sender.Uin)
+	source := MessageSource{
+		SourceType: MessageSourcePrivate,
+		PrimaryID:  uint64(m.Sender.Uin),
 	}
-	id := m.Id
-	if bot.db != nil {
-		id = bot.InsertPrivateMessage(m)
-	}
+	cqm := ToStringMessage(m.Elements, source, true)
+	id := bot.InsertPrivateMessage(m)
 	log.Infof("收到好友 %v(%v) 的消息: %v (%v)", m.Sender.DisplayName(), m.Sender.Uin, cqm, id)
-	fm := MSG{
+	fm := global.MSG{
 		"post_type": func() string {
 			if m.Sender.Uin == bot.Client.Uin {
 				return "message_sent"
@@ -56,12 +51,12 @@ func (bot *CQBot) privateMessageEvent(c *client.QQClient, m *message.PrivateMess
 		"message_id":   id,
 		"user_id":      m.Sender.Uin,
 		"target_id":    m.Target,
-		"message":      ToFormattedMessage(m.Elements, 0, false),
+		"message":      ToFormattedMessage(m.Elements, source, false),
 		"raw_message":  cqm,
 		"font":         0,
 		"self_id":      c.Uin,
 		"time":         time.Now().Unix(),
-		"sender": MSG{
+		"sender": global.MSG{
 			"user_id":  m.Sender.Uin,
 			"nickname": m.Sender.Nickname,
 			"sex":      "unknown",
@@ -69,22 +64,19 @@ func (bot *CQBot) privateMessageEvent(c *client.QQClient, m *message.PrivateMess
 		},
 	}
 	bot.dispatchEventMessage(fm)
-	if m.Sender.Uin != c.Uin {
-		c.MarkPrivateMessageReaded(m.Sender.Uin, int64(m.Time))
-	}
 }
 
 func (bot *CQBot) groupMessageEvent(c *client.QQClient, m *message.GroupMessage) {
-	bot.checkMedia(m.Elements)
+	bot.checkMedia(m.Elements, m.GroupCode)
 	for _, elem := range m.Elements {
 		if file, ok := elem.(*message.GroupFileElement); ok {
 			log.Infof("群 %v(%v) 内 %v(%v) 上传了文件: %v", m.GroupName, m.GroupCode, m.Sender.DisplayName(), m.Sender.Uin, file.Name)
-			bot.dispatchEventMessage(MSG{
+			bot.dispatchEventMessage(global.MSG{
 				"post_type":   "notice",
 				"notice_type": "group_upload",
 				"group_id":    m.GroupCode,
 				"user_id":     m.Sender.Uin,
-				"file": MSG{
+				"file": global.MSG{
 					"id":    file.Path,
 					"name":  file.Name,
 					"size":  file.Size,
@@ -97,11 +89,12 @@ func (bot *CQBot) groupMessageEvent(c *client.QQClient, m *message.GroupMessage)
 			return
 		}
 	}
-	cqm := ToStringMessage(m.Elements, m.GroupCode, true)
-	id := m.Id
-	if bot.db != nil {
-		id = bot.InsertGroupMessage(m)
+	source := MessageSource{
+		SourceType: MessageSourceGroup,
+		PrimaryID:  uint64(m.GroupCode),
 	}
+	cqm := ToStringMessage(m.Elements, source, true)
+	id := bot.InsertGroupMessage(m)
 	log.Infof("收到群 %v(%v) 内 %v(%v) 的消息: %v (%v)", m.GroupName, m.GroupCode, m.Sender.DisplayName(), m.Sender.Uin, cqm, id)
 	gm := bot.formatGroupMessage(m)
 	if gm == nil {
@@ -109,34 +102,36 @@ func (bot *CQBot) groupMessageEvent(c *client.QQClient, m *message.GroupMessage)
 	}
 	gm["message_id"] = id
 	bot.dispatchEventMessage(gm)
-	if m.Sender.Uin != c.Uin {
-		c.MarkGroupMessageReaded(m.GroupCode, int64(m.Id))
-	}
 }
 
 func (bot *CQBot) tempMessageEvent(c *client.QQClient, e *client.TempMessageEvent) {
 	m := e.Message
-	bot.checkMedia(m.Elements)
-	cqm := ToStringMessage(m.Elements, 0, true)
+	bot.checkMedia(m.Elements, m.Sender.Uin)
+	source := MessageSource{
+		SourceType: MessageSourcePrivate,
+		PrimaryID:  uint64(e.Session.Sender),
+	}
+	cqm := ToStringMessage(m.Elements, source, true)
 	bot.tempSessionCache.Store(m.Sender.Uin, e.Session)
 	id := m.Id
-	if bot.db != nil {
-		id = bot.InsertTempMessage(m.Sender.Uin, m)
-	}
+	// todo(Mrs4s)
+	// if bot.db != nil { // nolint
+	// 		id = bot.InsertTempMessage(m.Sender.Uin, m)
+	// }
 	log.Infof("收到来自群 %v(%v) 内 %v(%v) 的临时会话消息: %v", m.GroupName, m.GroupCode, m.Sender.DisplayName(), m.Sender.Uin, cqm)
-	tm := MSG{
+	tm := global.MSG{
 		"post_type":    "message",
 		"message_type": "private",
 		"sub_type":     "group",
 		"temp_source":  e.Session.Source,
 		"message_id":   id,
 		"user_id":      m.Sender.Uin,
-		"message":      ToFormattedMessage(m.Elements, 0, false),
+		"message":      ToFormattedMessage(m.Elements, source, false),
 		"raw_message":  cqm,
 		"font":         0,
 		"self_id":      c.Uin,
 		"time":         time.Now().Unix(),
-		"sender": MSG{
+		"sender": global.MSG{
 			"user_id":  m.Sender.Uin,
 			"group_id": m.GroupCode,
 			"nickname": m.Sender.Nickname,
@@ -145,6 +140,177 @@ func (bot *CQBot) tempMessageEvent(c *client.QQClient, e *client.TempMessageEven
 		},
 	}
 	bot.dispatchEventMessage(tm)
+}
+
+func (bot *CQBot) guildChannelMessageEvent(c *client.QQClient, m *message.GuildChannelMessage) {
+	bot.checkMedia(m.Elements, int64(m.Sender.TinyId))
+	guild := c.GuildService.FindGuild(m.GuildId)
+	if guild == nil {
+		return
+	}
+	channel := guild.FindChannel(m.ChannelId)
+	source := MessageSource{
+		SourceType: MessageSourceGuildChannel,
+		PrimaryID:  m.GuildId,
+		SubID:      m.ChannelId,
+	}
+	log.Infof("收到来自频道 %v(%v) 子频道 %v(%v) 内 %v(%v) 的消息: %v", guild.GuildName, guild.GuildId, channel.ChannelName, m.ChannelId, m.Sender.Nickname, m.Sender.TinyId, ToStringMessage(m.Elements, source, true))
+	id := bot.InsertGuildChannelMessage(m)
+	bot.dispatchEventMessage(global.MSG{
+		"post_type":    "message",
+		"message_type": "guild",
+		"sub_type":     "channel",
+		"guild_id":     fU64(m.GuildId),
+		"channel_id":   fU64(m.ChannelId),
+		"message_id":   id,
+		"user_id":      fU64(m.Sender.TinyId),
+		"message":      ToFormattedMessage(m.Elements, source, false), // todo: 增加对频道消息 Reply 的支持
+		"self_id":      bot.Client.Uin,
+		"self_tiny_id": fU64(bot.Client.GuildService.TinyId),
+		"time":         m.Time,
+		"sender": global.MSG{
+			"user_id":  m.Sender.TinyId,
+			"tiny_id":  fU64(m.Sender.TinyId),
+			"nickname": m.Sender.Nickname,
+		},
+	})
+}
+
+func (bot *CQBot) guildMessageReactionsUpdatedEvent(c *client.QQClient, e *client.GuildMessageReactionsUpdatedEvent) {
+	guild := c.GuildService.FindGuild(e.GuildId)
+	if guild == nil {
+		return
+	}
+	msgID := encodeGuildMessageID(e.GuildId, e.ChannelId, e.MessageId, MessageSourceGuildChannel)
+	str := fmt.Sprintf("频道 %v(%v) 消息 %v 表情贴片已更新: ", guild.GuildName, guild.GuildId, msgID)
+	currentReactions := make([]global.MSG, len(e.CurrentReactions))
+	for i, r := range e.CurrentReactions {
+		str += fmt.Sprintf("%v*%v ", r.Face.Name, r.Count)
+		currentReactions[i] = global.MSG{
+			"emoji_id":    r.EmojiId,
+			"emoji_index": r.Face.Index,
+			"emoji_type":  r.EmojiType,
+			"emoji_name":  r.Face.Name,
+			"count":       r.Count,
+			"clicked":     r.Clicked,
+		}
+	}
+	if len(e.CurrentReactions) == 0 {
+		str += "无任何表情"
+	}
+	log.Infof(str)
+	bot.dispatchEventMessage(global.MSG{
+		"post_type":         "notice",
+		"notice_type":       "message_reactions_updated",
+		"guild_id":          fU64(e.GuildId),
+		"channel_id":        fU64(e.ChannelId),
+		"message_id":        msgID,
+		"operator_id":       fU64(e.OperatorId),
+		"current_reactions": currentReactions,
+		"time":              time.Now().Unix(),
+		"self_id":           bot.Client.Uin,
+		"self_tiny_id":      fU64(bot.Client.GuildService.TinyId),
+		"user_id":           e.OperatorId,
+	})
+}
+
+func (bot *CQBot) guildChannelMessageRecalledEvent(c *client.QQClient, e *client.GuildMessageRecalledEvent) {
+	guild := c.GuildService.FindGuild(e.GuildId)
+	if guild == nil {
+		return
+	}
+	channel := guild.FindChannel(e.ChannelId)
+	if channel == nil {
+		return
+	}
+	operator, err := c.GuildService.FetchGuildMemberProfileInfo(e.GuildId, e.OperatorId)
+	if err != nil {
+		log.Errorf("处理频道撤回事件时出现错误: 获取操作者资料时出现错误 %v", err)
+		return
+	}
+	msgID := encodeGuildMessageID(e.GuildId, e.ChannelId, e.MessageId, MessageSourceGuildChannel)
+	log.Infof("用户 %v(%v) 撤回了频道 %v(%v) 子频道 %v(%v) 的消息 %v", operator.Nickname, operator.TinyId, guild.GuildName, guild.GuildId, channel.ChannelName, channel.ChannelId, msgID)
+	bot.dispatchEventMessage(global.MSG{
+		"post_type":    "notice",
+		"notice_type":  "guild_channel_recall",
+		"guild_id":     fU64(e.GuildId),
+		"channel_id":   fU64(e.ChannelId),
+		"operator_id":  fU64(e.OperatorId),
+		"message_id":   msgID,
+		"time":         time.Now().Unix(),
+		"self_id":      bot.Client.Uin,
+		"self_tiny_id": fU64(bot.Client.GuildService.TinyId),
+		"user_id":      e.OperatorId,
+	})
+}
+
+func (bot *CQBot) guildChannelUpdatedEvent(c *client.QQClient, e *client.GuildChannelUpdatedEvent) {
+	guild := c.GuildService.FindGuild(e.GuildId)
+	if guild == nil {
+		return
+	}
+	log.Infof("频道 %v(%v) 子频道 %v(%v) 信息已更新", guild.GuildName, guild.GuildId, e.NewChannelInfo.ChannelName, e.NewChannelInfo.ChannelId)
+	bot.dispatchEventMessage(global.MSG{
+		"post_type":    "notice",
+		"notice_type":  "channel_updated",
+		"guild_id":     fU64(e.GuildId),
+		"channel_id":   fU64(e.ChannelId),
+		"operator_id":  fU64(e.OperatorId),
+		"time":         time.Now().Unix(),
+		"self_id":      bot.Client.Uin,
+		"self_tiny_id": fU64(bot.Client.GuildService.TinyId),
+		"user_id":      e.OperatorId,
+		"old_info":     convertChannelInfo(e.OldChannelInfo),
+		"new_info":     convertChannelInfo(e.NewChannelInfo),
+	})
+}
+
+func (bot *CQBot) guildChannelCreatedEvent(c *client.QQClient, e *client.GuildChannelOperationEvent) {
+	guild := c.GuildService.FindGuild(e.GuildId)
+	if guild == nil {
+		return
+	}
+	member, _ := c.GuildService.FetchGuildMemberProfileInfo(e.GuildId, e.OperatorId)
+	if member == nil {
+		member = &client.GuildUserProfile{Nickname: "未知"}
+	}
+	log.Infof("频道 %v(%v) 内用户 %v(%v) 创建了子频道 %v(%v)", guild.GuildName, guild.GuildId, member.Nickname, member.TinyId, e.ChannelInfo.ChannelName, e.ChannelInfo.ChannelId)
+	bot.dispatchEventMessage(global.MSG{
+		"post_type":    "notice",
+		"notice_type":  "channel_created",
+		"guild_id":     fU64(e.GuildId),
+		"channel_id":   fU64(e.ChannelInfo.ChannelId),
+		"operator_id":  fU64(e.OperatorId),
+		"self_id":      bot.Client.Uin,
+		"self_tiny_id": fU64(bot.Client.GuildService.TinyId),
+		"user_id":      e.OperatorId,
+		"time":         time.Now().Unix(),
+		"channel_info": convertChannelInfo(e.ChannelInfo),
+	})
+}
+
+func (bot *CQBot) guildChannelDestroyedEvent(c *client.QQClient, e *client.GuildChannelOperationEvent) {
+	guild := c.GuildService.FindGuild(e.GuildId)
+	if guild == nil {
+		return
+	}
+	member, _ := c.GuildService.FetchGuildMemberProfileInfo(e.GuildId, e.OperatorId)
+	if member == nil {
+		member = &client.GuildUserProfile{Nickname: "未知"}
+	}
+	log.Infof("频道 %v(%v) 内用户 %v(%v) 删除了子频道 %v(%v)", guild.GuildName, guild.GuildId, member.Nickname, member.TinyId, e.ChannelInfo.ChannelName, e.ChannelInfo.ChannelId)
+	bot.dispatchEventMessage(global.MSG{
+		"post_type":    "notice",
+		"notice_type":  "channel_destroyed",
+		"guild_id":     fU64(e.GuildId),
+		"channel_id":   fU64(e.ChannelInfo.ChannelId),
+		"operator_id":  fU64(e.OperatorId),
+		"self_id":      bot.Client.Uin,
+		"self_tiny_id": fU64(bot.Client.GuildService.TinyId),
+		"user_id":      e.OperatorId,
+		"time":         time.Now().Unix(),
+		"channel_info": convertChannelInfo(e.ChannelInfo),
+	})
 }
 
 func (bot *CQBot) groupMutedEvent(c *client.QQClient, e *client.GroupMuteEvent) {
@@ -167,7 +333,7 @@ func (bot *CQBot) groupMutedEvent(c *client.QQClient, e *client.GroupMuteEvent) 
 		}
 	}
 
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"duration":    e.Time,
 		"group_id":    e.GroupCode,
@@ -187,10 +353,10 @@ func (bot *CQBot) groupMutedEvent(c *client.QQClient, e *client.GroupMuteEvent) 
 
 func (bot *CQBot) groupRecallEvent(c *client.QQClient, e *client.GroupMessageRecalledEvent) {
 	g := c.FindGroup(e.GroupCode)
-	gid := toGlobalID(e.GroupCode, e.MessageId)
+	gid := db.ToGlobalID(e.GroupCode, e.MessageId)
 	log.Infof("群 %v 内 %v 撤回了 %v 的消息: %v.",
 		formatGroupName(g), formatMemberName(g.FindMember(e.OperatorUin)), formatMemberName(g.FindMember(e.AuthorUin)), gid)
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"group_id":    e.GroupCode,
 		"notice_type": "group_recall",
@@ -209,7 +375,7 @@ func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 		sender := group.FindMember(notify.Sender)
 		receiver := group.FindMember(notify.Receiver)
 		log.Infof("群 %v 内 %v 戳了戳 %v", formatGroupName(group), formatMemberName(sender), formatMemberName(receiver))
-		bot.dispatchEventMessage(MSG{
+		bot.dispatchEventMessage(global.MSG{
 			"post_type":   "notice",
 			"group_id":    group.Code,
 			"notice_type": "notify",
@@ -224,7 +390,7 @@ func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 		sender := group.FindMember(notify.Sender)
 		luckyKing := group.FindMember(notify.LuckyKing)
 		log.Infof("群 %v 内 %v 的红包被抢完, %v 是运气王", formatGroupName(group), formatMemberName(sender), formatMemberName(luckyKing))
-		bot.dispatchEventMessage(MSG{
+		bot.dispatchEventMessage(global.MSG{
 			"post_type":   "notice",
 			"group_id":    group.Code,
 			"notice_type": "notify",
@@ -237,7 +403,7 @@ func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 		})
 	case *client.MemberHonorChangedNotifyEvent:
 		log.Info(notify.Content())
-		bot.dispatchEventMessage(MSG{
+		bot.dispatchEventMessage(global.MSG{
 			"post_type":   "notice",
 			"group_id":    group.Code,
 			"notice_type": "notify",
@@ -268,8 +434,12 @@ func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 func (bot *CQBot) friendNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 	friend := c.FindFriend(e.From())
 	if notify, ok := e.(*client.FriendPokeNotifyEvent); ok {
-		log.Infof("好友 %v 戳了戳你.", friend.Nickname)
-		bot.dispatchEventMessage(MSG{
+		if notify.Receiver == notify.Sender {
+			log.Infof("好友 %v 戳了戳自己.", friend.Nickname)
+		} else {
+			log.Infof("好友 %v 戳了戳你.", friend.Nickname)
+		}
+		bot.dispatchEventMessage(global.MSG{
 			"post_type":   "notice",
 			"notice_type": "notify",
 			"sub_type":    "poke",
@@ -282,15 +452,31 @@ func (bot *CQBot) friendNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 	}
 }
 
+func (bot *CQBot) memberTitleUpdatedEvent(c *client.QQClient, e *client.MemberSpecialTitleUpdatedEvent) {
+	group := c.FindGroup(e.GroupCode)
+	mem := group.FindMember(e.Uin)
+	log.Infof("群 %v(%v) 内成员 %v(%v) 获得了新的头衔: %v", group.Name, group.Code, mem.DisplayName(), mem.Uin, e.NewTitle)
+	bot.dispatchEventMessage(global.MSG{
+		"post_type":   "notice",
+		"notice_type": "notify",
+		"sub_type":    "title",
+		"group_id":    group.Code,
+		"self_id":     c.Uin,
+		"user_id":     e.Uin,
+		"time":        time.Now().Unix(),
+		"title":       e.NewTitle,
+	})
+}
+
 func (bot *CQBot) friendRecallEvent(c *client.QQClient, e *client.FriendMessageRecalledEvent) {
 	f := c.FindFriend(e.FriendUin)
-	gid := toGlobalID(e.FriendUin, e.MessageId)
+	gid := db.ToGlobalID(e.FriendUin, e.MessageId)
 	if f != nil {
 		log.Infof("好友 %v(%v) 撤回了消息: %v", f.Nickname, f.Uin, gid)
 	} else {
 		log.Infof("好友 %v 撤回了消息: %v", e.FriendUin, gid)
 	}
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"notice_type": "friend_recall",
 		"self_id":     c.Uin,
@@ -306,11 +492,11 @@ func (bot *CQBot) offlineFileEvent(c *client.QQClient, e *client.OfflineFileEven
 		return
 	}
 	log.Infof("好友 %v(%v) 发送了离线文件 %v", f.Nickname, f.Uin, e.FileName)
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"notice_type": "offline_file",
 		"user_id":     e.Sender,
-		"file": MSG{
+		"file": global.MSG{
 			"name": e.FileName,
 			"size": e.FileSize,
 			"url":  e.DownloadUrl,
@@ -341,7 +527,7 @@ func (bot *CQBot) memberPermissionChangedEvent(c *client.QQClient, e *client.Mem
 		}
 		return "unset"
 	}()
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"notice_type": "group_admin",
 		"sub_type":    st,
@@ -354,7 +540,7 @@ func (bot *CQBot) memberPermissionChangedEvent(c *client.QQClient, e *client.Mem
 
 func (bot *CQBot) memberCardUpdatedEvent(c *client.QQClient, e *client.MemberCardUpdatedEvent) {
 	log.Infof("群 %v 的 %v 更新了名片 %v -> %v", formatGroupName(e.Group), formatMemberName(e.Member), e.OldCard, e.Member.CardName)
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"notice_type": "group_card",
 		"group_id":    e.Group.Code,
@@ -384,7 +570,7 @@ func (bot *CQBot) friendRequestEvent(c *client.QQClient, e *client.NewFriendRequ
 	log.Infof("收到来自 %v(%v) 的好友请求: %v", e.RequesterNick, e.RequesterUin, e.Message)
 	flag := strconv.FormatInt(e.RequestId, 10)
 	bot.friendReqCache.Store(flag, e)
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":    "request",
 		"request_type": "friend",
 		"user_id":      e.RequesterUin,
@@ -398,7 +584,7 @@ func (bot *CQBot) friendRequestEvent(c *client.QQClient, e *client.NewFriendRequ
 func (bot *CQBot) friendAddedEvent(c *client.QQClient, e *client.NewFriendEvent) {
 	log.Infof("添加了新好友: %v(%v)", e.Friend.Nickname, e.Friend.Uin)
 	bot.tempSessionCache.Delete(e.Friend.Uin)
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"notice_type": "friend_add",
 		"self_id":     c.Uin,
@@ -410,7 +596,7 @@ func (bot *CQBot) friendAddedEvent(c *client.QQClient, e *client.NewFriendEvent)
 func (bot *CQBot) groupInvitedEvent(c *client.QQClient, e *client.GroupInvitedRequest) {
 	log.Infof("收到来自群 %v(%v) 内用户 %v(%v) 的加群邀请.", e.GroupName, e.GroupCode, e.InvitorNick, e.InvitorUin)
 	flag := strconv.FormatInt(e.RequestId, 10)
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":    "request",
 		"request_type": "group",
 		"sub_type":     "invite",
@@ -426,7 +612,7 @@ func (bot *CQBot) groupInvitedEvent(c *client.QQClient, e *client.GroupInvitedRe
 func (bot *CQBot) groupJoinReqEvent(c *client.QQClient, e *client.UserJoinGroupRequest) {
 	log.Infof("群 %v(%v) 收到来自用户 %v(%v) 的加群请求.", e.GroupName, e.GroupCode, e.RequesterNick, e.RequesterUin)
 	flag := strconv.FormatInt(e.RequestId, 10)
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":    "request",
 		"request_type": "group",
 		"sub_type":     "add",
@@ -445,11 +631,11 @@ func (bot *CQBot) otherClientStatusChangedEvent(c *client.QQClient, e *client.Ot
 	} else {
 		log.Infof("Bot 账号在客户端 %v (%v) 登出.", e.Client.DeviceName, e.Client.DeviceKind)
 	}
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"notice_type": "client_status",
 		"online":      e.Online,
-		"client": MSG{
+		"client": global.MSG{
 			"app_id":      e.Client.AppId,
 			"device_name": e.Client.DeviceName,
 			"device_kind": e.Client.DeviceKind,
@@ -461,7 +647,7 @@ func (bot *CQBot) otherClientStatusChangedEvent(c *client.QQClient, e *client.Ot
 
 func (bot *CQBot) groupEssenceMsg(c *client.QQClient, e *client.GroupDigestEvent) {
 	g := c.FindGroup(e.GroupCode)
-	gid := toGlobalID(e.GroupCode, e.MessageID)
+	gid := db.ToGlobalID(e.GroupCode, e.MessageID)
 	if e.OperationType == 1 {
 		log.Infof(
 			"群 %v 内 %v 将 %v 的消息(%v)设为了精华消息.",
@@ -482,7 +668,7 @@ func (bot *CQBot) groupEssenceMsg(c *client.QQClient, e *client.GroupDigestEvent
 	if e.OperatorUin == bot.Client.Uin {
 		return
 	}
-	bot.dispatchEventMessage(MSG{
+	bot.dispatchEventMessage(global.MSG{
 		"post_type":   "notice",
 		"group_id":    e.GroupCode,
 		"notice_type": "essence",
@@ -500,8 +686,8 @@ func (bot *CQBot) groupEssenceMsg(c *client.QQClient, e *client.GroupDigestEvent
 	})
 }
 
-func (bot *CQBot) groupIncrease(groupCode, operatorUin, userUin int64) MSG {
-	return MSG{
+func (bot *CQBot) groupIncrease(groupCode, operatorUin, userUin int64) global.MSG {
+	return global.MSG{
 		"post_type":   "notice",
 		"notice_type": "group_increase",
 		"group_id":    groupCode,
@@ -513,8 +699,8 @@ func (bot *CQBot) groupIncrease(groupCode, operatorUin, userUin int64) MSG {
 	}
 }
 
-func (bot *CQBot) groupDecrease(groupCode, userUin int64, operator *client.GroupMemberInfo) MSG {
-	return MSG{
+func (bot *CQBot) groupDecrease(groupCode, userUin int64, operator *client.GroupMemberInfo) global.MSG {
+	return global.MSG{
 		"post_type":   "notice",
 		"notice_type": "group_decrease",
 		"group_id":    groupCode,
@@ -539,30 +725,51 @@ func (bot *CQBot) groupDecrease(groupCode, userUin int64, operator *client.Group
 	}
 }
 
-func (bot *CQBot) checkMedia(e []message.IMessageElement) {
+func (bot *CQBot) checkMedia(e []message.IMessageElement, sourceID int64) {
 	for _, elem := range e {
 		switch i := elem.(type) {
 		case *message.GroupImageElement:
+			if i.Flash && sourceID != 0 {
+				u, err := bot.Client.GetGroupImageDownloadUrl(i.FileId, sourceID, i.Md5)
+				if err != nil {
+					log.Warnf("获取闪照地址时出现错误: %v", err)
+				} else {
+					i.Url = u
+				}
+			}
+			data := binary.NewWriterF(func(w *binary.Writer) {
+				w.Write(i.Md5)
+				w.WriteUInt32(uint32(i.Size))
+				w.WriteString(i.ImageId)
+				w.WriteString(i.Url)
+			})
+			cache.Image.Insert(i.Md5, data)
+
+		case *message.GuildImageElement:
+			data := binary.NewWriterF(func(w *binary.Writer) {
+				w.Write(i.Md5)
+				w.WriteUInt32(uint32(i.Size))
+				w.WriteString(i.DownloadIndex)
+				w.WriteString(i.Url)
+			})
 			filename := hex.EncodeToString(i.Md5) + ".image"
-			if !global.PathExists(path.Join(global.ImagePath, filename)) {
-				_ = os.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
-					w.Write(i.Md5)
-					w.WriteUInt32(uint32(i.Size))
-					w.WriteString(i.ImageId)
-					w.WriteString(i.Url)
-				}), 0o644)
+			cache.Image.Insert(i.Md5, data)
+			if i.Url != "" && !global.PathExists(path.Join(global.ImagePath, "guild-images", filename)) {
+				if err := global.DownloadFile(i.Url, path.Join(global.ImagePath, "guild-images", filename), -1, nil); err != nil {
+					log.Warnf("下载频道图片时出现错误: %v", err)
+				}
 			}
 		case *message.FriendImageElement:
-			filename := hex.EncodeToString(i.Md5) + ".image"
-			if !global.PathExists(path.Join(global.ImagePath, filename)) {
-				_ = os.WriteFile(path.Join(global.ImagePath, filename), binary.NewWriterF(func(w *binary.Writer) {
-					w.Write(i.Md5)
-					w.WriteUInt32(uint32(i.Size))
-					w.WriteString(i.ImageId)
-					w.WriteString(i.Url)
-				}), 0o644)
-			}
+			data := binary.NewWriterF(func(w *binary.Writer) {
+				w.Write(i.Md5)
+				w.WriteUInt32(uint32(i.Size))
+				w.WriteString(i.ImageId)
+				w.WriteString(i.Url)
+			})
+			cache.Image.Insert(i.Md5, data)
+
 		case *message.VoiceElement:
+			// todo: don't download original file?
 			i.Name = strings.ReplaceAll(i.Name, "{", "")
 			i.Name = strings.ReplaceAll(i.Name, "}", "")
 			if !global.PathExists(path.Join(global.VoicePath, i.Name)) {
@@ -574,17 +781,16 @@ func (bot *CQBot) checkMedia(e []message.IMessageElement) {
 				_ = os.WriteFile(path.Join(global.VoicePath, i.Name), b, 0o644)
 			}
 		case *message.ShortVideoElement:
+			data := binary.NewWriterF(func(w *binary.Writer) {
+				w.Write(i.Md5)
+				w.Write(i.ThumbMd5)
+				w.WriteUInt32(uint32(i.Size))
+				w.WriteUInt32(uint32(i.ThumbSize))
+				w.WriteString(i.Name)
+				w.Write(i.Uuid)
+			})
 			filename := hex.EncodeToString(i.Md5) + ".video"
-			if !global.PathExists(path.Join(global.VideoPath, filename)) {
-				_ = os.WriteFile(path.Join(global.VideoPath, filename), binary.NewWriterF(func(w *binary.Writer) {
-					w.Write(i.Md5)
-					w.Write(i.ThumbMd5)
-					w.WriteUInt32(uint32(i.Size))
-					w.WriteUInt32(uint32(i.ThumbSize))
-					w.WriteString(i.Name)
-					w.Write(i.Uuid)
-				}), 0o644)
-			}
+			cache.Video.Insert(i.Md5, data)
 			i.Name = filename
 			i.Url = bot.Client.GetShortVideoUrl(i.Uuid, i.Md5)
 		}

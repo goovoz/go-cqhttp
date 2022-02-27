@@ -1,45 +1,71 @@
 package server
 
 import (
-	"context"
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Mrs4s/MiraiGo/utils"
-	"github.com/guonaihong/gout"
-	"github.com/guonaihong/gout/dataflow"
-	jsoniter "github.com/json-iterator/go"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"gopkg.in/yaml.v3"
 
 	"github.com/Mrs4s/go-cqhttp/coolq"
-	"github.com/Mrs4s/go-cqhttp/global/config"
+	"github.com/Mrs4s/go-cqhttp/global"
+	"github.com/Mrs4s/go-cqhttp/modules/api"
+	"github.com/Mrs4s/go-cqhttp/modules/config"
+	"github.com/Mrs4s/go-cqhttp/modules/filter"
 )
+
+// HTTPServer HTTP通信相关配置
+type HTTPServer struct {
+	Disabled    bool   `yaml:"disabled"`
+	Host        string `yaml:"host"`
+	Port        int    `yaml:"port"`
+	Timeout     int32  `yaml:"timeout"`
+	LongPolling struct {
+		Enabled      bool `yaml:"enabled"`
+		MaxQueueSize int  `yaml:"max-queue-size"`
+	} `yaml:"long-polling"`
+	Post []httpServerPost `yaml:"post"`
+
+	MiddleWares `yaml:"middlewares"`
+}
+
+type httpServerPost struct {
+	URL             string  `yaml:"url"`
+	Secret          string  `yaml:"secret"`
+	MaxRetries      *uint64 `yaml:"max-retries"`
+	RetriesInterval *uint64 `yaml:"retries-interval"`
+}
 
 type httpServer struct {
 	HTTP        *http.Server
-	api         *apiCaller
+	api         *api.Caller
 	accessToken string
 }
 
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
-
 // HTTPClient 反向HTTP上报客户端
 type HTTPClient struct {
-	bot     *coolq.CQBot
-	secret  string
-	addr    string
-	filter  string
-	apiPort int
-	timeout int32
+	bot             *coolq.CQBot
+	secret          string
+	addr            string
+	filter          string
+	apiPort         int
+	timeout         int32
+	MaxRetries      uint64
+	RetriesInterval uint64
 }
 
 type httpCtx struct {
@@ -48,22 +74,72 @@ type httpCtx struct {
 	postForm url.Values
 }
 
-func (h *httpCtx) Get(s string) gjson.Result {
-	j := h.json.Get(s)
-	if j.Exists() {
-		return j
+const httpDefault = `
+  - http: # HTTP 通信设置
+      host: 127.0.0.1 # 服务端监听地址
+      port: 5700      # 服务端监听端口
+      timeout: 5      # 反向 HTTP 超时时间, 单位秒，<5 时将被忽略
+      long-polling:   # 长轮询拓展
+        enabled: false       # 是否开启
+        max-queue-size: 2000 # 消息队列大小，0 表示不限制队列大小，谨慎使用
+      middlewares:
+        <<: *default # 引用默认中间件
+      post:           # 反向HTTP POST地址列表
+      #- url: ''                # 地址
+      #  secret: ''             # 密钥
+	  #  max-retries: 3         # 最大重试，0 时禁用
+      #  retries-interval: 1500 # 重试时间，单位毫秒，0 时立即
+      #- url: http://127.0.0.1:5701/ # 地址
+      #  secret: ''                  # 密钥
+	  #  max-retries: 10             # 最大重试，0 时禁用
+      #  retries-interval: 1000      # 重试时间，单位毫秒，0 时立即
+`
+
+func init() {
+	config.AddServer(&config.Server{Brief: "HTTP通信", Default: httpDefault})
+}
+
+var joinQuery = regexp.MustCompile(`\[(.+?),(.+?)]\.0`)
+
+func (h *httpCtx) get(s string, join bool) gjson.Result {
+	// support gjson advanced syntax:
+	// h.Get("[a,b].0") see usage in http_test.go
+	if join && joinQuery.MatchString(s) {
+		matched := joinQuery.FindStringSubmatch(s)
+		if r := h.get(matched[1], false); r.Exists() {
+			return r
+		}
+		return h.get(matched[2], false)
+	}
+
+	validJSONParam := func(p string) bool {
+		return (strings.HasPrefix(p, "{") || strings.HasPrefix(p, "[")) && gjson.Valid(p)
 	}
 	if h.postForm != nil {
 		if form := h.postForm.Get(s); form != "" {
+			if validJSONParam(form) {
+				return gjson.Result{Type: gjson.JSON, Raw: form}
+			}
 			return gjson.Result{Type: gjson.String, Str: form}
 		}
 	}
 	if h.query != nil {
 		if query := h.query.Get(s); query != "" {
+			if validJSONParam(query) {
+				return gjson.Result{Type: gjson.JSON, Raw: query}
+			}
 			return gjson.Result{Type: gjson.String, Str: query}
 		}
 	}
 	return gjson.Result{}
+}
+
+func (h *httpCtx) Get(s string) gjson.Result {
+	j := h.json.Get(s)
+	if j.Exists() {
+		return j
+	}
+	return h.get(s, true)
 }
 
 func (s *httpServer) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -107,14 +183,21 @@ func (s *httpServer) ServeHTTP(writer http.ResponseWriter, request *http.Request
 		return
 	}
 
-	action := strings.TrimPrefix(request.URL.Path, "/")
-	action = strings.TrimSuffix(action, "_async")
-	log.Debugf("HTTPServer接收到API调用: %v", action)
-	ret := s.api.callAPI(action, &ctx)
+	var response global.MSG
+	if request.URL.Path == "/" {
+		action := strings.TrimSuffix(ctx.Get("action").Str, "_async")
+		log.Debugf("HTTPServer接收到API调用: %v", action)
+		response = s.api.Call(action, ctx.Get("params"))
+	} else {
+		action := strings.TrimPrefix(request.URL.Path, "/")
+		action = strings.TrimSuffix(action, "_async")
+		log.Debugf("HTTPServer接收到API调用: %v", action)
+		response = s.api.Call(action, &ctx)
+	}
 
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(writer).Encode(ret)
+	_ = json.NewEncoder(writer).Encode(response)
 }
 
 func checkAuth(req *http.Request, token string) int {
@@ -142,26 +225,36 @@ func checkAuth(req *http.Request, token string) int {
 	}
 }
 
-// RunHTTPServerAndClients 启动HTTP服务器与HTTP上报客户端
-func RunHTTPServerAndClients(bot *coolq.CQBot, conf *config.HTTPServer) {
-	if conf.Disabled {
+func puint64Operator(p *uint64, def uint64) uint64 {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
+// runHTTP 启动HTTP服务器与HTTP上报客户端
+func runHTTP(bot *coolq.CQBot, node yaml.Node) {
+	var conf HTTPServer
+	switch err := node.Decode(&conf); {
+	case err != nil:
+		log.Warn("读取http配置失败 :", err)
+		fallthrough
+	case conf.Disabled:
 		return
 	}
-	var (
-		s    = new(httpServer)
-		addr string
-	)
-	s.accessToken = conf.AccessToken
+
+	var addr string
+	s := &httpServer{accessToken: conf.AccessToken}
 	if conf.Host == "" || conf.Port == 0 {
 		goto client
 	}
 	addr = fmt.Sprintf("%s:%d", conf.Host, conf.Port)
-	s.api = newAPICaller(bot)
+	s.api = api.NewCaller(bot)
 	if conf.RateLimit.Enabled {
-		s.api.use(rateLimit(conf.RateLimit.Frequency, conf.RateLimit.Bucket))
+		s.api.Use(rateLimit(conf.RateLimit.Frequency, conf.RateLimit.Bucket))
 	}
 	if conf.LongPolling.Enabled {
-		s.api.use(longPolling(bot, conf.LongPolling.MaxQueueSize))
+		s.api.Use(longPolling(bot, conf.LongPolling.MaxQueueSize))
 	}
 
 	go func() {
@@ -182,12 +275,14 @@ client:
 	for _, c := range conf.Post {
 		if c.URL != "" {
 			go HTTPClient{
-				bot:     bot,
-				secret:  c.Secret,
-				addr:    c.URL,
-				apiPort: conf.Port,
-				filter:  conf.Filter,
-				timeout: conf.Timeout,
+				bot:             bot,
+				secret:          c.Secret,
+				addr:            c.URL,
+				apiPort:         conf.Port,
+				filter:          conf.Filter,
+				timeout:         conf.Timeout,
+				MaxRetries:      puint64Operator(c.MaxRetries, 3),
+				RetriesInterval: puint64Operator(c.RetriesInterval, 1500),
 			}.Run()
 		}
 	}
@@ -195,7 +290,7 @@ client:
 
 // Run 运行反向HTTP服务
 func (c HTTPClient) Run() {
-	addFilter(c.filter)
+	filter.Add(c.filter)
 	if c.timeout < 5 {
 		c.timeout = 5
 	}
@@ -204,59 +299,63 @@ func (c HTTPClient) Run() {
 }
 
 func (c *HTTPClient) onBotPushEvent(e *coolq.Event) {
-	var res string
 	if c.filter != "" {
-		filter := findFilter(c.filter)
-		if filter != nil && !filter.Eval(gjson.Parse(e.JSONString())) {
+		flt := filter.Find(c.filter)
+		if flt != nil && !flt.Eval(gjson.Parse(e.JSONString())) {
 			log.Debugf("上报Event %v 到 HTTP 服务器 %s 时被过滤.", c.addr, e.JSONBytes())
 			return
 		}
 	}
 
-	err := gout.POST(c.addr).SetJSON(e.JSONBytes()).BindBody(&res).SetHeader(func() gout.H {
-		h := gout.H{
-			"X-Self-ID":  c.bot.Client.Uin,
-			"User-Agent": "CQHttp/4.15.0",
+	client := http.Client{Timeout: time.Second * time.Duration(c.timeout)}
+	header := make(http.Header)
+	header.Set("X-Self-ID", strconv.FormatInt(c.bot.Client.Uin, 10))
+	header.Set("User-Agent", "CQHttp/4.15.0")
+	header.Set("Content-Type", "application/json")
+	if c.secret != "" {
+		mac := hmac.New(sha1.New, []byte(c.secret))
+		_, _ = mac.Write(e.JSONBytes())
+		header.Set("X-Signature", "sha1="+hex.EncodeToString(mac.Sum(nil)))
+	}
+	if c.apiPort != 0 {
+		header.Set("X-API-Port", strconv.FormatInt(int64(c.apiPort), 10))
+	}
+
+	var res *http.Response
+	for i := uint64(0); i <= c.MaxRetries; i++ {
+		// see https://stackoverflow.com/questions/31337891/net-http-http-contentlength-222-with-body-length-0
+		// we should create a new request for every single post trial
+		req, err := http.NewRequest("POST", c.addr, bytes.NewReader(e.JSONBytes()))
+		if err != nil {
+			log.Warnf("上报 Event 数据到 %v 时创建请求失败: %v", c.addr, err)
+			return
 		}
-		if c.secret != "" {
-			mac := hmac.New(sha1.New, []byte(c.secret))
-			_, err := mac.Write(e.JSONBytes())
-			if err != nil {
-				log.Error(err)
-				return nil
-			}
-			h["X-Signature"] = "sha1=" + hex.EncodeToString(mac.Sum(nil))
+		req.Header = header
+
+		res, err = client.Do(req)
+		if res != nil {
+			//goland:noinspection GoDeferInLoop
+			defer res.Body.Close()
 		}
-		if c.apiPort != 0 {
-			h["X-API-Port"] = c.apiPort
+		if err == nil {
+			break
 		}
-		return h
-	}()).SetTimeout(time.Second * time.Duration(c.timeout)).F().Retry().Attempt(5).
-		WaitTime(time.Millisecond * 500).MaxWaitTime(time.Second * 5).
-		Func(func(con *dataflow.Context) error {
-			if con.Error != nil {
-				log.Warnf("上报Event到 HTTP 服务器 %v 时出现错误: %v 将重试.", c.addr, con.Error)
-				return con.Error
-			}
-			return nil
-		}).Do()
+		if i < c.MaxRetries {
+			log.Warnf("上报 Event 数据到 %v 失败: %v 将进行第 %d 次重试", c.addr, err, i+1)
+		} else {
+			log.Warnf("上报 Event 数据 %s 到 %v 失败: %v 停止上报：已达重试上线", e.JSONBytes(), c.addr, err)
+			return
+		}
+		time.Sleep(time.Millisecond * time.Duration(c.RetriesInterval))
+	}
+
+	log.Debugf("上报Event数据 %s 到 %v", e.JSONBytes(), c.addr)
+
+	r, err := io.ReadAll(res.Body)
 	if err != nil {
-		log.Warnf("上报Event数据 %s 到 %v 失败: %v", e.JSONBytes(), c.addr, err)
 		return
 	}
-	log.Debugf("上报Event数据 %s 到 %v", e.JSONBytes(), c.addr)
-	if gjson.Valid(res) {
-		c.bot.CQHandleQuickOperation(gjson.Parse(e.JSONString()), gjson.Parse(res))
+	if gjson.ValidBytes(r) {
+		c.bot.CQHandleQuickOperation(gjson.Parse(e.JSONString()), gjson.ParseBytes(r))
 	}
-}
-
-func (s *httpServer) ShutDown() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := s.HTTP.Shutdown(ctx); err != nil {
-		log.Fatal("http Server Shutdown:", err)
-	}
-	<-ctx.Done()
-	log.Println("timeout of 5 seconds.")
-	log.Println("http Server exiting")
 }

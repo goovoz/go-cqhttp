@@ -3,7 +3,6 @@ package global
 import (
 	"bytes"
 	"crypto/md5"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"net"
@@ -16,6 +15,8 @@ import (
 
 	"github.com/Mrs4s/MiraiGo/utils"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/Mrs4s/go-cqhttp/internal/param"
 )
 
 const (
@@ -31,6 +32,8 @@ const (
 	VideoPath = "data/videos"
 	// CachePath go-cqhttp使用的缓存目录
 	CachePath = "data/cache"
+	// DumpsPath go-cqhttp使用错误转储目录
+	DumpsPath = "dumps"
 )
 
 var (
@@ -45,7 +48,7 @@ var (
 // PathExists 判断给定path是否存在
 func PathExists(path string) bool {
 	_, err := os.Stat(path)
-	return err == nil || os.IsExist(err)
+	return err == nil || errors.Is(err, os.ErrExist)
 }
 
 // ReadAllText 读取给定path对应文件，无法读取时返回空值
@@ -84,12 +87,9 @@ func FindFile(file, cache, p string) (data []byte, err error) {
 	data, err = nil, ErrSyntax
 	switch {
 	case strings.HasPrefix(file, "http"): // https also has prefix http
-		if cache == "" {
-			cache = "1"
-		}
 		hash := md5.Sum([]byte(file))
 		cacheFile := path.Join(CachePath, hex.EncodeToString(hash[:])+".cache")
-		if PathExists(cacheFile) && cache == "1" {
+		if (cache == "" || cache == "1") && PathExists(cacheFile) {
 			return os.ReadFile(cacheFile)
 		}
 		data, err = GetBytes(file)
@@ -98,7 +98,7 @@ func FindFile(file, cache, p string) (data []byte, err error) {
 			return nil, err
 		}
 	case strings.HasPrefix(file, "base64"):
-		data, err = base64.StdEncoding.DecodeString(strings.TrimPrefix(file, "base64://"))
+		data, err = param.Base64DecodeString(strings.TrimPrefix(file, "base64://"))
 		if err != nil {
 			return nil, err
 		}
